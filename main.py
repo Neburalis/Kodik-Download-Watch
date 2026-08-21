@@ -172,7 +172,10 @@ def download_choose_seria(serv, id, data):
     if data == "None":
         return
     data = data.split('-')
-    series = [int(x) for x in data[0].split(":")]
+    if data[0].split(':')[1] == '0':
+        series = 0
+    else:
+        series = [int(x) for x in data[0].split(":")]
     return render_template('download.html', series=series, backlink=f"/download/{serv}/{id}/",
                            is_dark=session['is_dark'] if "is_dark" in session.keys() else False, is_mobile=g.is_mobile)
 
@@ -187,7 +190,7 @@ def redirect_to_download(serv, id, data, download_type, quality, seria):
         if serv == "sh":
             if ch_use and ch.is_seria("sh"+id, translation_id, seria):
                 # Получаем данные из кеша (если есть и используется)
-                url = ch.get_seria("sh"+id, translation_id, seria)[0]
+                url = ch.get_seria("sh"+id, translation_id, seria)
             else:
                 # Получаем данные с сервера
                 url = get_download_link(id, "shikimori", seria, translation_id, token)

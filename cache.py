@@ -80,7 +80,7 @@ class Cache:
         else:
             raise KeyError("Id not found")
     
-    def get_seria(self, id: str, translation_id: str, seria_num: int) -> tuple[str, list[int, int]]:
+    def get_seria(self, id: str, translation_id: str, seria_num: int) -> tuple[str, None, list[int, int]]:
         if seria_num in self.data[id]['urls'][translation_id].keys():
             return self.data[id]['urls'][translation_id][seria_num]
         else:
