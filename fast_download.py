@@ -7,7 +7,6 @@ import json
 import requests
 import os
 import subprocess
-import shutil
 import stat
 import threading
 import time
@@ -18,6 +17,38 @@ _download_locks = {}
 _download_locks_guard = threading.Lock()
 _NORMALIZATION_PROFILE = "h264-cfr-24000-1001-crf18-aac160-v1"
 _LOCK_ROOT = '.tmp-locks'
+
+
+def _open_real_directory(path: str, create: bool = False) -> int:
+    if create:
+        try:
+            os.mkdir(path, 0o700)
+        except FileExistsError:
+            pass
+    return os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+
+
+def _remove_tree_at(parent_fd: int, name: str) -> None:
+    entry_stat = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if not stat.S_ISDIR(entry_stat.st_mode):
+        os.unlink(name, dir_fd=parent_fd)
+        return
+    directory_fd = os.open(
+        name,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        dir_fd=parent_fd,
+    )
+    try:
+        for child in os.listdir(directory_fd):
+            _remove_tree_at(directory_fd, child)
+    finally:
+        os.close(directory_fd)
+    os.rmdir(name, dir_fd=parent_fd)
+
+
+def _clear_directory_fd(directory_fd: int) -> None:
+    for name in os.listdir(directory_fd):
+        _remove_tree_at(directory_fd, name)
 
 
 def build_cache_hash(
@@ -57,12 +88,16 @@ def _download_lock(hsh: str):
     entry["lock"].acquire()
     file_lock_fd = None
     try:
-        os.makedirs(_LOCK_ROOT, exist_ok=True)
-        file_lock_fd = os.open(
-            os.path.join(_LOCK_ROOT, hsh + '.lock'),
-            os.O_RDWR | os.O_CREAT,
-            0o600,
-        )
+        lock_root_fd = _open_real_directory(_LOCK_ROOT, create=True)
+        try:
+            file_lock_fd = os.open(
+                hsh + '.lock',
+                os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=lock_root_fd,
+            )
+        finally:
+            os.close(lock_root_fd)
         fcntl.flock(file_lock_fd, fcntl.LOCK_EX)
         yield
     finally:
@@ -94,6 +129,17 @@ def fast_download(id: str, id_type: str, seria_num: int, translation_id: str, qu
             id, id_type, seria_num, translation_id, quality, token, filename, metadata, hsh
         )
 
+
+def fast_download_open(id: str, id_type: str, seria_num: int, translation_id: str, quality: str, token: str, filename: str = 'result', metadata: dict | None = None):
+    check_ffmpeg()
+    metadata = dict(metadata or {})
+    hsh = build_cache_hash(id, id_type, translation_id, seria_num, quality, metadata)
+    with _download_lock(hsh):
+        download_hash, link_data = _fast_download_locked(
+            id, id_type, seria_num, translation_id, quality, token, filename, metadata, hsh
+        )
+        return download_hash, link_data, _open_cache_file(download_hash)
+
 def _fast_download_locked(
     id: str,
     id_type: str,
@@ -105,20 +151,30 @@ def _fast_download_locked(
     metadata: dict,
     hsh: str,
 ) -> tuple[str, tuple | None]:
-    cache_root = os.path.join('tmp', hsh)
-    os.makedirs('tmp', exist_ok=True)
-    if os.path.isdir(cache_root):
-        try:
-            get_path(hsh)
-        except FileNotFoundError:
-            shutil.rmtree(cache_root)
-        else:
-            return (hsh, None)
-    elif os.path.lexists(cache_root):
-        os.unlink(cache_root)
-    os.mkdir(cache_root, 0o700)
-
+    tmp_fd = _open_real_directory('tmp', create=True)
+    cache_fd = None
     try:
+        try:
+            cache_stat = os.stat(hsh, dir_fd=tmp_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            cache_stat = None
+        if cache_stat is not None and not stat.S_ISDIR(cache_stat.st_mode):
+            raise OSError('Fast-download cache entry is not a real directory')
+        if cache_stat is not None:
+            try:
+                get_path(hsh)
+            except FileNotFoundError:
+                _remove_tree_at(tmp_fd, hsh)
+            else:
+                return (hsh, None)
+        os.mkdir(hsh, 0o700, dir_fd=tmp_fd)
+        os.fsync(tmp_fd)
+        cache_fd = os.open(
+            hsh,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=tmp_fd,
+        )
+
         request_id_type = id_type
         if request_id_type == 'sh':
             request_id_type = 'shikimori'
@@ -139,7 +195,8 @@ def _fast_download_locked(
                 executor.submit(
                     download_segment,
                     segment_url,
-                    os.path.join(cache_root, local_name + '.ts'),
+                    local_name + '.ts',
+                    directory_fd=cache_fd,
                 )
                 for segment_url, local_name in segments
             ]
@@ -147,31 +204,68 @@ def _fast_download_locked(
                 future.result()
 
         temporary_stem = '.encode-' + uuid.uuid4().hex
-        temporary_path = os.path.join(cache_root, temporary_stem + '.mp4')
-        output_path = os.path.join(cache_root, 'result.mp4')
         combine_segments(
-            cache_root + os.sep,
+            '',
             segments_count=len(segments),
             name=temporary_stem,
             metadata=metadata,
+            directory_fd=cache_fd,
         )
-        if not os.path.isfile(temporary_path) or os.path.getsize(temporary_path) <= 0:
-            raise RuntimeError('FFmpeg did not produce a non-empty MP4 file')
-        os.replace(temporary_path, output_path)
-        cache_fd = os.open(cache_root, os.O_RDONLY | os.O_DIRECTORY)
+        temporary_fd = os.open(
+            temporary_stem + '.mp4',
+            os.O_RDONLY | os.O_NOFOLLOW,
+            dir_fd=cache_fd,
+        )
         try:
-            os.fsync(cache_fd)
+            temporary_stat = os.fstat(temporary_fd)
+            if not stat.S_ISREG(temporary_stat.st_mode) or temporary_stat.st_size <= 0:
+                raise RuntimeError('FFmpeg did not produce a non-empty MP4 file')
+            os.fsync(temporary_fd)
         finally:
-            os.close(cache_fd)
-        for artifact in os.listdir(cache_root):
+            os.close(temporary_fd)
+        current_stat = os.stat(hsh, dir_fd=tmp_fd, follow_symlinks=False)
+        opened_stat = os.fstat(cache_fd)
+        if (
+            not stat.S_ISDIR(current_stat.st_mode)
+            or (current_stat.st_dev, current_stat.st_ino)
+            != (opened_stat.st_dev, opened_stat.st_ino)
+        ):
+            raise OSError('Fast-download cache directory changed during download')
+        os.replace(
+            temporary_stem + '.mp4',
+            'result.mp4',
+            src_dir_fd=cache_fd,
+            dst_dir_fd=cache_fd,
+        )
+        os.fsync(cache_fd)
+        for artifact in os.listdir(cache_fd):
             if artifact != 'result.mp4':
-                artifact_path = os.path.join(cache_root, artifact)
-                if os.path.isfile(artifact_path) or os.path.islink(artifact_path):
-                    os.remove(artifact_path)
+                artifact_stat = os.stat(
+                    artifact, dir_fd=cache_fd, follow_symlinks=False
+                )
+                if stat.S_ISREG(artifact_stat.st_mode) or stat.S_ISLNK(artifact_stat.st_mode):
+                    os.unlink(artifact, dir_fd=cache_fd)
         return (hsh, link_data)
     except Exception:
-        shutil.rmtree(cache_root, ignore_errors=True)
+        if cache_fd is not None:
+            _clear_directory_fd(cache_fd)
+            try:
+                current_stat = os.stat(hsh, dir_fd=tmp_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                opened_stat = os.fstat(cache_fd)
+                if (
+                    stat.S_ISDIR(current_stat.st_mode)
+                    and (current_stat.st_dev, current_stat.st_ino)
+                    == (opened_stat.st_dev, opened_stat.st_ino)
+                ):
+                    os.rmdir(hsh, dir_fd=tmp_fd)
         raise
+    finally:
+        if cache_fd is not None:
+            os.close(cache_fd)
+        os.close(tmp_fd)
 
 def get_segments(manifest: str, original_link: str) -> list[list[str]]:
     segments = []
@@ -204,12 +298,14 @@ def get_url_data_with_retries(url: str, attempts: int = 5) -> str:
             time.sleep(0.25 * (2 ** attempt))
     raise RuntimeError('unreachable')
 
-def download_segment(link: str, path: str, attempts: int = 5):
+def download_segment(link: str, path: str, attempts: int = 5, directory_fd: int | None = None):
     for attempt in range(attempts):
         try:
             res = requests.get(link, timeout=30)
             res.raise_for_status()
-            with open(path, 'wb') as f:
+            open_flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
+            file_fd = os.open(path, open_flags, 0o600, dir_fd=directory_fd)
+            with os.fdopen(file_fd, 'wb') as f:
                 f.write(res.content)
             return
         except requests.RequestException:
@@ -217,10 +313,11 @@ def download_segment(link: str, path: str, attempts: int = 5):
                 raise
             time.sleep(0.25 * (2 ** attempt))
 
-def combine_segments(directory: str, segments_count: int, name: str = 'result', metadata: dict | None = None, hwaccel: str | None = None):
+def combine_segments(directory: str, segments_count: int, name: str = 'result', metadata: dict | None = None, hwaccel: str | None = None, directory_fd: int | None = None):
+    directory_ref = directory_fd if directory_fd is not None else directory
     files = [
         filename
-        for filename in os.listdir(directory)
+        for filename in os.listdir(directory_ref)
         if filename.endswith('.ts') and filename[:-3].isdigit()
     ]
     if len(files) != segments_count:
@@ -228,11 +325,26 @@ def combine_segments(directory: str, segments_count: int, name: str = 'result', 
     r = ''
     for file in sorted(files, key=lambda x: int(x[:-3])):
         r += "file '"+file+"'\n"
-    with open(directory+'files.txt', 'w') as f:
+    if directory_fd is None:
+        files_stream = open(directory+'files.txt', 'w')
+        concat_path = directory+'files.txt'
+        output_path = directory+name+'.mp4'
+    else:
+        files_fd = os.open(
+            'files.txt',
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=directory_fd,
+        )
+        files_stream = os.fdopen(files_fd, 'w')
+        descriptor_path = f'/proc/self/fd/{directory_fd}/'
+        concat_path = descriptor_path + 'files.txt'
+        output_path = descriptor_path + name + '.mp4'
+    with files_stream as f:
         f.write(r)
     command = [
         'ffmpeg', '-y',
-        '-f', 'concat', '-safe', '1', '-i', directory+'files.txt',
+        '-f', 'concat', '-safe', '1', '-i', concat_path,
         '-map', '0:v:0', '-map', '0:a:0',
         '-map_metadata', '0', '-map_chapters', '0',
         '-vf', 'settb=AVTB,setpts=PTS-STARTPTS,fps=24000/1001',
@@ -245,21 +357,49 @@ def combine_segments(directory: str, segments_count: int, name: str = 'result', 
     ]
     for key, value in sorted((metadata or {}).items()):
         command.extend(['-metadata', f'{key}={value}'])
-    command.append(directory+name+'.mp4')
-    subprocess.run(command, check=True)
+    command.append(output_path)
+    run_options = {'check': True}
+    if directory_fd is not None:
+        run_options['pass_fds'] = (directory_fd,)
+    subprocess.run(command, **run_options)
 
-def get_path(hsh: str) -> str:
-    result_path = os.path.join('tmp', hsh, 'result.mp4')
+def _open_cache_file(hsh: str):
+    if os.path.basename(hsh) != hsh or hsh in {'.', '..'}:
+        raise OSError('Invalid fast-download cache key')
+    cache_root_fd = _open_real_directory('tmp')
     try:
-        result_stat = os.stat(result_path, follow_symlinks=False)
+        cache_fd = os.open(
+            hsh,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=cache_root_fd,
+        )
+    finally:
+        os.close(cache_root_fd)
+    try:
+        result_fd = os.open(
+            'result.mp4',
+            os.O_RDONLY | os.O_NOFOLLOW,
+            dir_fd=cache_fd,
+        )
     except FileNotFoundError:
         raise FileNotFoundError(
             f'Result .mp4 file not found in "{hsh}" directory'
         ) from None
+    finally:
+        os.close(cache_fd)
+    result_stat = os.fstat(result_fd)
     if not stat.S_ISREG(result_stat.st_mode) or result_stat.st_size <= 0:
+        os.close(result_fd)
         raise FileNotFoundError(
             f'Result .mp4 file not found in "{hsh}" directory'
         )
+    return os.fdopen(result_fd, 'rb')
+
+
+def get_path(hsh: str) -> str:
+    result_path = os.path.join('tmp', hsh, 'result.mp4')
+    with _open_cache_file(hsh):
+        pass
     return result_path
 
 def check_ffmpeg():
@@ -275,23 +415,27 @@ def clear_tmp():
     """
     Clear inactive fast-download cache entries.
     """
-    os.makedirs('tmp', exist_ok=True)
-    os.makedirs(_LOCK_ROOT, exist_ok=True)
-    for name in os.listdir('tmp'):
-        lock_fd = os.open(
-            os.path.join(_LOCK_ROOT, name + '.lock'),
-            os.O_RDWR | os.O_CREAT,
-            0o600,
-        )
-        try:
+    cache_fd = _open_real_directory('tmp', create=True)
+    lock_root_fd = _open_real_directory(_LOCK_ROOT, create=True)
+    try:
+        for name in os.listdir(cache_fd):
+            lock_fd = os.open(
+                name + '.lock',
+                os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=lock_root_fd,
+            )
             try:
-                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                continue
-            cache_path = os.path.join('tmp', name)
-            if os.path.isdir(cache_path) and not os.path.islink(cache_path):
-                shutil.rmtree(cache_path)
-            elif os.path.lexists(cache_path):
-                os.unlink(cache_path)
-        finally:
-            os.close(lock_fd)
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    continue
+                try:
+                    _remove_tree_at(cache_fd, name)
+                except FileNotFoundError:
+                    pass
+            finally:
+                os.close(lock_fd)
+    finally:
+        os.close(lock_root_fd)
+        os.close(cache_fd)

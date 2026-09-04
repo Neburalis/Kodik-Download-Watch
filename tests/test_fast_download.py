@@ -140,6 +140,87 @@ class FastDownloadNetworkTests(unittest.TestCase):
             finally:
                 os.chdir(previous_directory)
 
+    def test_get_path_rejects_symlinked_hash_directory(self):
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as outside:
+            outside_result = Path(outside) / "result.mp4"
+            outside_result.write_bytes(b"outside")
+            previous_directory = os.getcwd()
+            os.chdir(directory)
+            try:
+                Path("tmp").mkdir()
+                (Path("tmp") / "hash~").symlink_to(outside, target_is_directory=True)
+
+                with self.assertRaises(OSError):
+                    fast_download.get_path("hash~")
+
+                self.assertEqual(outside_result.read_bytes(), b"outside")
+            finally:
+                os.chdir(previous_directory)
+
+    def test_fast_download_rejects_symlinked_hash_directory(self):
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as outside, mock.patch.object(
+            fast_download, "check_ffmpeg"
+        ):
+            outside_result = Path(outside) / "result.mp4"
+            outside_result.write_bytes(b"outside")
+            previous_directory = os.getcwd()
+            os.chdir(directory)
+            try:
+                expected_hash = fast_download.build_cache_hash("1", "sh", "610", 1, "720", {})
+                Path("tmp").mkdir()
+                (Path("tmp") / expected_hash).symlink_to(outside, target_is_directory=True)
+
+                with self.assertRaises(OSError):
+                    fast_download.fast_download("1", "sh", 1, "610", "720", None)
+
+                self.assertTrue((Path("tmp") / expected_hash).is_symlink())
+                self.assertEqual(outside_result.read_bytes(), b"outside")
+            finally:
+                os.chdir(previous_directory)
+
+    def test_fast_download_does_not_follow_hash_directory_replaced_during_download(self):
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as outside, mock.patch.object(
+            fast_download, "check_ffmpeg"
+        ):
+            outside_result = Path(outside) / "result.mp4"
+            outside_result.write_bytes(b"outside")
+            previous_directory = os.getcwd()
+            os.chdir(directory)
+            try:
+                expected_hash = fast_download.build_cache_hash("1", "sh", "610", 1, "720", {})
+
+                def replace_cache_directory(*_args):
+                    (Path("tmp") / expected_hash).rename(Path("tmp") / "moved")
+                    (Path("tmp") / expected_hash).symlink_to(outside, target_is_directory=True)
+                    return ("//cdn.example/", None, [])
+
+                def fake_combine(directory, segments_count, name="result", metadata=None, hwaccel=None, directory_fd=None):
+                    file_fd = os.open(
+                        f"{name}.mp4", os.O_WRONLY | os.O_CREAT, 0o600, dir_fd=directory_fd
+                    )
+                    os.write(file_fd, b"video")
+                    os.close(file_fd)
+
+                with mock.patch.object(
+                    fast_download, "get_download_link", side_effect=replace_cache_directory
+                ), mock.patch.object(
+                    fast_download, "get_url_data_with_retries", return_value="manifest"
+                ), mock.patch.object(
+                    fast_download, "get_segments", return_value=[["https://cdn.example/0.ts", "0"]]
+                ), mock.patch.object(
+                    fast_download, "download_segment"
+                ), mock.patch.object(
+                    fast_download, "combine_segments", side_effect=fake_combine
+                ):
+                    with self.assertRaises(OSError):
+                        fast_download.fast_download("1", "sh", 1, "610", "720", None)
+
+                self.assertEqual(outside_result.read_bytes(), b"outside")
+                self.assertFalse((Path(outside) / "0.ts").exists())
+                self.assertTrue((Path("tmp") / expected_hash).is_symlink())
+            finally:
+                os.chdir(previous_directory)
+
     def test_download_segment_retries_transient_http_failures(self):
         class Handler(BaseHTTPRequestHandler):
             attempts = 0
@@ -240,13 +321,25 @@ file /tmp/owned.ts
         )
 
     def test_interrupted_transcode_removes_segments_and_partial_output(self):
-        def write_segment(_url, path):
+        def write_segment(_url, path, directory_fd=None):
+            if directory_fd is not None:
+                file_fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600, dir_fd=directory_fd)
+                os.close(file_fd)
+                return
             Path(path).write_bytes(b"segment")
 
         def interrupted_combine(
-            directory, segments_count, name="result", metadata=None, hwaccel=None
+            directory, segments_count, name="result", metadata=None, hwaccel=None,
+            directory_fd=None,
         ):
-            Path(directory, f"{name}.mp4").write_bytes(b"partial")
+            if directory_fd is None:
+                Path(directory, f"{name}.mp4").write_bytes(b"partial")
+            else:
+                file_fd = os.open(
+                    f"{name}.mp4", os.O_WRONLY | os.O_CREAT, 0o600, dir_fd=directory_fd
+                )
+                os.write(file_fd, b"partial")
+                os.close(file_fd)
             raise subprocess.CalledProcessError(1, ["ffmpeg"])
 
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(
@@ -282,8 +375,15 @@ file /tmp/owned.ts
         manifest_response.text = "manifest"
         manifest_response.raise_for_status.return_value = None
 
-        def fake_combine(directory, segments_count, name="result", metadata=None, hwaccel=None):
-            Path(directory, f"{name}.mp4").write_bytes(b"video")
+        def fake_combine(directory, segments_count, name="result", metadata=None, hwaccel=None, directory_fd=None):
+            if directory_fd is None:
+                Path(directory, f"{name}.mp4").write_bytes(b"video")
+            else:
+                file_fd = os.open(
+                    f"{name}.mp4", os.O_WRONLY | os.O_CREAT, 0o600, dir_fd=directory_fd
+                )
+                os.write(file_fd, b"video")
+                os.close(file_fd)
 
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(
             fast_download, "get_download_link", return_value=("//cdn.example/", None, [])
@@ -312,17 +412,128 @@ file /tmp/owned.ts
             finally:
                 os.chdir(previous_directory)
 
+    def test_fast_cache_fsyncs_file_before_rename_and_directory_after(self):
+        events = []
+        original_fsync = os.fsync
+        original_replace = os.replace
+
+        def fake_combine(directory, segments_count, name="result", metadata=None, hwaccel=None, directory_fd=None):
+            file_fd = os.open(
+                f"{name}.mp4", os.O_WRONLY | os.O_CREAT, 0o600, dir_fd=directory_fd
+            )
+            os.write(file_fd, b"video")
+            os.close(file_fd)
+
+        def track_fsync(file_descriptor):
+            mode = os.fstat(file_descriptor).st_mode
+            events.append("directory-fsync" if fast_download.stat.S_ISDIR(mode) else "file-fsync")
+            return original_fsync(file_descriptor)
+
+        def track_replace(source, destination, **kwargs):
+            events.append("rename")
+            return original_replace(source, destination, **kwargs)
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            fast_download, "check_ffmpeg"
+        ), mock.patch.object(
+            fast_download, "get_download_link", return_value=("//cdn.example/", None, [])
+        ), mock.patch.object(
+            fast_download, "get_url_data_with_retries", return_value="manifest"
+        ), mock.patch.object(
+            fast_download, "get_segments", return_value=[["https://cdn.example/0.ts", "0"]]
+        ), mock.patch.object(
+            fast_download, "download_segment"
+        ), mock.patch.object(
+            fast_download, "combine_segments", side_effect=fake_combine
+        ), mock.patch.object(
+            fast_download.os, "fsync", side_effect=track_fsync
+        ), mock.patch.object(
+            fast_download.os, "replace", side_effect=track_replace
+        ):
+            previous_directory = os.getcwd()
+            os.chdir(directory)
+            try:
+                fast_download.fast_download("1", "sh", 1, "610", "720", None)
+            finally:
+                os.chdir(previous_directory)
+
+        self.assertEqual(
+            events,
+            ["directory-fsync", "file-fsync", "rename", "directory-fsync"],
+        )
+
+    def test_fast_cache_fsyncs_tmp_parent_before_first_segment_write(self):
+        events = []
+        original_fsync = os.fsync
+        original_mkdir = os.mkdir
+
+        def track_mkdir(path, mode=0o777, *, dir_fd=None):
+            result = original_mkdir(path, mode, dir_fd=dir_fd)
+            if dir_fd is not None and str(path).endswith("~"):
+                events.append("hash-mkdir")
+            return result
+
+        def track_fsync(file_descriptor):
+            if fast_download.stat.S_ISDIR(os.fstat(file_descriptor).st_mode):
+                events.append("directory-fsync")
+            return original_fsync(file_descriptor)
+
+        def write_segment(_url, path, directory_fd=None):
+            events.append("segment-write")
+            file_fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600, dir_fd=directory_fd)
+            os.write(file_fd, b"segment")
+            os.close(file_fd)
+
+        def fake_combine(directory, segments_count, name="result", metadata=None, hwaccel=None, directory_fd=None):
+            file_fd = os.open(
+                f"{name}.mp4", os.O_WRONLY | os.O_CREAT, 0o600, dir_fd=directory_fd
+            )
+            os.write(file_fd, b"video")
+            os.close(file_fd)
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            fast_download, "check_ffmpeg"
+        ), mock.patch.object(
+            fast_download, "get_download_link", return_value=("//cdn.example/", None, [])
+        ), mock.patch.object(
+            fast_download, "get_url_data_with_retries", return_value="manifest"
+        ), mock.patch.object(
+            fast_download, "get_segments", return_value=[["https://cdn.example/0.ts", "0"]]
+        ), mock.patch.object(
+            fast_download, "download_segment", side_effect=write_segment
+        ), mock.patch.object(
+            fast_download, "combine_segments", side_effect=fake_combine
+        ), mock.patch.object(
+            fast_download.os, "mkdir", side_effect=track_mkdir
+        ), mock.patch.object(
+            fast_download.os, "fsync", side_effect=track_fsync
+        ):
+            previous_directory = os.getcwd()
+            os.chdir(directory)
+            try:
+                fast_download.fast_download("1", "sh", 1, "610", "720", None)
+            finally:
+                os.chdir(previous_directory)
+
+        self.assertEqual(events[:3], ["hash-mkdir", "directory-fsync", "segment-write"])
+
     def test_duplicate_fast_downloads_for_same_episode_are_serialized(self):
         entered_download = threading.Event()
         release_download = threading.Event()
 
-        def blocked_download(_link, path):
+        def blocked_download(_link, path, directory_fd=None):
             entered_download.set()
             self.assertTrue(release_download.wait(2))
-            Path(path).write_bytes(b"segment")
+            file_fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600, dir_fd=directory_fd)
+            os.write(file_fd, b"segment")
+            os.close(file_fd)
 
-        def fake_combine(directory, segments_count, name="result", metadata=None, hwaccel=None):
-            Path(directory, f"{name}.mp4").write_bytes(b"video")
+        def fake_combine(directory, segments_count, name="result", metadata=None, hwaccel=None, directory_fd=None):
+            file_fd = os.open(
+                f"{name}.mp4", os.O_WRONLY | os.O_CREAT, 0o600, dir_fd=directory_fd
+            )
+            os.write(file_fd, b"video")
+            os.close(file_fd)
 
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(
             fast_download, "get_download_link", return_value=("//cdn.example/", None, [])
@@ -377,6 +588,31 @@ file /tmp/owned.ts
             for item in range(100):
                 fast_download.fast_download(str(item), "sh", 1, "610", "720", None)
         self.assertEqual(fast_download._download_locks, {})
+
+    def test_fast_download_open_survives_cache_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            fast_download, "check_ffmpeg"
+        ), mock.patch.object(
+            fast_download, "_fast_download_locked", return_value=("hash~", None)
+        ):
+            previous_directory = os.getcwd()
+            os.chdir(directory)
+            try:
+                cache_directory = Path("tmp/hash~")
+                cache_directory.mkdir(parents=True)
+                (cache_directory / "result.mp4").write_bytes(b"video")
+
+                _download_hash, _link_data, source = fast_download.fast_download_open(
+                    "1", "sh", 1, "610", "720", None
+                )
+                fast_download.clear_tmp()
+                try:
+                    self.assertFalse(cache_directory.exists())
+                    self.assertEqual(source.read(), b"video")
+                finally:
+                    source.close()
+            finally:
+                os.chdir(previous_directory)
 
     def test_download_lock_serializes_independent_processes(self):
         worker = r'''
@@ -461,9 +697,29 @@ with fast_download._download_lock("shared"):
                 os.chdir(previous_directory)
                 self.assertEqual(process.wait(timeout=5), 0)
 
+    def test_clear_tmp_rejects_symlinked_cache_root(self):
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as outside:
+            outside_file = Path(outside) / "keep.mp4"
+            outside_file.write_bytes(b"keep")
+            previous_directory = os.getcwd()
+            os.chdir(directory)
+            try:
+                Path("tmp").symlink_to(outside, target_is_directory=True)
+
+                with self.assertRaises(OSError):
+                    fast_download.clear_tmp()
+
+                self.assertEqual(outside_file.read_bytes(), b"keep")
+            finally:
+                os.chdir(previous_directory)
+
     def test_fast_download_discards_zero_byte_cached_mp4(self):
-        def fake_combine(directory, segments_count, name="result", metadata=None, hwaccel=None):
-            Path(directory, f"{name}.mp4").write_bytes(b"video")
+        def fake_combine(directory, segments_count, name="result", metadata=None, hwaccel=None, directory_fd=None):
+            file_fd = os.open(
+                f"{name}.mp4", os.O_WRONLY | os.O_CREAT, 0o600, dir_fd=directory_fd
+            )
+            os.write(file_fd, b"video")
+            os.close(file_fd)
 
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(
             fast_download, "check_ffmpeg"
@@ -474,7 +730,7 @@ with fast_download._download_lock("shared"):
         ), mock.patch.object(
             fast_download, "get_segments", return_value=[["https://cdn.example/0.ts", "0"]]
         ), mock.patch.object(
-            fast_download, "download_segment", side_effect=lambda _url, path: Path(path).write_bytes(b"segment")
+            fast_download, "download_segment", side_effect=lambda _url, path, directory_fd=None: None
         ), mock.patch.object(
             fast_download, "combine_segments", side_effect=fake_combine
         ):
@@ -495,12 +751,18 @@ with fast_download._download_lock("shared"):
                 os.chdir(previous_directory)
 
     def test_fast_download_removes_hls_segments_after_successful_assembly(self):
-        def write_segment(_url, path):
-            Path(path).write_bytes(b"segment")
+        def write_segment(_url, path, directory_fd=None):
+            file_fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600, dir_fd=directory_fd)
+            os.write(file_fd, b"segment")
+            os.close(file_fd)
 
-        def fake_combine(directory, segments_count, name="result", metadata=None, hwaccel=None):
-            Path(directory, "files.txt").write_text("segments", encoding="utf-8")
-            Path(directory, f"{name}.mp4").write_bytes(b"video")
+        def fake_combine(directory, segments_count, name="result", metadata=None, hwaccel=None, directory_fd=None):
+            for filename, data in (("files.txt", b"segments"), (f"{name}.mp4", b"video")):
+                file_fd = os.open(
+                    filename, os.O_WRONLY | os.O_CREAT, 0o600, dir_fd=directory_fd
+                )
+                os.write(file_fd, data)
+                os.close(file_fd)
 
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(
             fast_download, "check_ffmpeg"

@@ -184,12 +184,6 @@ def download_choose_seria(serv, id, data):
 def _get_batch_serial_data(serv, anime_id):
     if serv not in {"sh", "kp"}:
         raise ValueError("Неизвестный источник аниме")
-    cache_key = serv + anime_id
-    if ch_use and ch.is_id(cache_key):
-        cached = ch.get_data_by_id(cache_key)
-        serial_data = cached.get("serial_data") if isinstance(cached, dict) else None
-        if isinstance(serial_data, dict) and serial_data:
-            return serial_data
     id_type = "shikimori" if serv == "sh" else "kinopoisk"
     return get_serial_info(anime_id, id_type, token)
 
@@ -539,7 +533,7 @@ def change_room_quality(rid, quality):
 @app.route('/fast_download_act/<string:id_type>-<string:id>-<int:seria_num>-<string:translation_id>-<string:quality>/')
 @app.route('/fast_download_act/<string:id_type>-<string:id>-<int:seria_num>-<string:translation_id>-<string:quality>-<int:max_series>/')
 def fast_download_work(id_type: str, id: str, seria_num: int, translation_id: str, quality: str, max_series: int = 12):
-    from fast_download import fast_download, get_path
+    from fast_download import fast_download_open
     translation = translations[translation_id] if translation_id in translations else "Неизвестно"
     add_zeros = len(str(max_series))
     if config.USE_SAVED_DATA and ch.is_id(id_type+id):
@@ -564,21 +558,25 @@ def fast_download_work(id_type: str, id: str, seria_num: int, translation_id: st
         .replace('»', '\'').replace('«', '\'').replace('„', '\'').replace('“', '\'').replace('<', '[') \
         .replace(']', ')').replace('|', '-').replace('--', '-').replace('--', '-')
     try:
-        hsh, link_data = fast_download(id, id_type, seria_num, translation_id, quality, config.KODIK_TOKEN,
+        _hsh, link_data, source = fast_download_open(id, id_type, seria_num, translation_id, quality, config.KODIK_TOKEN,
                             filename=fname, metadata=metadata)
-        if ch_save and link_data is not None:
-            try:
-                # Попытка записать данные к уже имеющимся данным
-                ch.add_seria(
-                    id_type+id,
-                    translation_id,
-                    seria_num,
-                    link_data[0],
-                    link_data[2],
-                )
-            except KeyError:
-                pass
-        return send_file(get_path(hsh), as_attachment=True, download_name=fname+'.mp4')
+        try:
+            if ch_save and link_data is not None:
+                try:
+                    # Попытка записать данные к уже имеющимся данным
+                    ch.add_seria(
+                        id_type+id,
+                        translation_id,
+                        seria_num,
+                        link_data[0],
+                        link_data[2],
+                    )
+                except KeyError:
+                    pass
+            return send_file(source, as_attachment=True, download_name=fname+'.mp4')
+        except Exception:
+            source.close()
+            raise
     except ModuleNotFoundError:
         return abort(500, 'Внимание, на сервере не установлен ffmpeg или программа не может получить к нему доступ. Ffmpeg обязателен для использования быстрой загрузки. (Стандартная загрузка работает без ffmpeg)')
     except FileNotFoundError:

@@ -3,13 +3,14 @@
 An injected ``episode_downloader`` is called once per non-skipped episode with
 keyword arguments ``serv``, ``anime_id``, ``episode``, ``translation_id``,
 ``quality``, ``token``, ``anime_title``, and ``metadata``. It must return the path of a
-finished source video. The manager copies that source into the season directory
-atomically; the downloader does not write the final destination itself.
+finished source video or an open source file. The manager copies that source into the
+season directory atomically; the downloader does not write the final destination itself.
 """
 
 from __future__ import annotations
 
 import copy
+import hashlib
 import os
 import re
 import shutil
@@ -61,7 +62,7 @@ def validate_batch_selection(
             and all(type(value) is int for value in series_range)
             and 1 <= series_range[0] <= series_range[1]
         ):
-            allowed_first, allowed_last = series_range
+            allowed_first, allowed_last = series_range[0], min(series_range[1], series_count)
         else:
             allowed_first, allowed_last = 1, series_count
     if first_episode < allowed_first or last_episode > allowed_last:
@@ -237,7 +238,8 @@ class BatchDownloadManager:
     ) -> None:
         destination = self._anime_directory / anime_id
         try:
-            destination_fd = self._open_destination_directory(anime_id, serv)
+            destination_fds = self._open_destination_directory(anime_id, serv)
+            destination_fd = destination_fds[-1]
         except Exception as exc:
             with self._lock:
                 job = self._jobs[job_id]
@@ -256,7 +258,9 @@ class BatchDownloadManager:
             with self._lock:
                 self._jobs[job_id]["status"] = "running"
             for index, episode in enumerate(episodes):
-                filename = self._episode_filename(episode, translation_name, quality, width)
+                filename = self._episode_filename(
+                    episode, translation_id, translation_name, quality, width
+                )
                 final_path = destination / filename
                 if self._is_nonempty_regular_file(destination_fd, filename):
                     with self._lock:
@@ -289,8 +293,7 @@ class BatchDownloadManager:
                                 "track": str(episode),
                             }
                         )
-                    source = Path(
-                        self._episode_downloader(
+                    source = self._episode_downloader(
                             serv=serv,
                             anime_id=anime_id,
                             episode=episode,
@@ -300,8 +303,11 @@ class BatchDownloadManager:
                             anime_title=anime_title,
                             metadata=episode_metadata,
                         )
-                    )
-                    published = self._atomic_publish(source, destination_fd, filename)
+                    try:
+                        published = self._atomic_publish(source, destination_fd, filename)
+                    finally:
+                        if hasattr(source, "close"):
+                            source.close()
                     with self._lock:
                         item["file"] = str(final_path)
                         if published:
@@ -345,7 +351,8 @@ class BatchDownloadManager:
                 job["current_episode"] = None
                 job["status"] = "completed_with_errors"
         finally:
-            os.close(destination_fd)
+            for directory_fd in reversed(destination_fds):
+                os.close(directory_fd)
             self._release_active_job(job_id)
 
     def _release_active_job(self, job_id: str) -> None:
@@ -354,25 +361,33 @@ class BatchDownloadManager:
             if job_key is not None and self._active_keys.get(job_key) == job_id:
                 self._active_keys.pop(job_key, None)
 
-    def _open_destination_directory(self, anime_id: str, serv: str) -> int:
+    def _open_destination_directory(self, anime_id: str, serv: str) -> list[int]:
         """Open and claim the configured destination without following symlinks."""
-        self._anime_directory.mkdir(parents=True, exist_ok=True)
         directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-        root_fd = os.open(self._anime_directory, directory_flags)
+        configured = self._anime_directory
+        if ".." in configured.parts:
+            raise ValueError("anime_directory may not contain parent traversal")
+        anchor = configured.anchor or "."
+        components = configured.parts[1:] if configured.is_absolute() else configured.parts
+        directory_fds = [os.open(anchor, directory_flags)]
         try:
-            try:
-                os.mkdir(anime_id, mode=0o755, dir_fd=root_fd)
-                os.fsync(root_fd)
-            except FileExistsError:
-                pass
-            destination_fd = os.open(anime_id, directory_flags, dir_fd=root_fd)
-        finally:
-            os.close(root_fd)
-        try:
+            for component in (*components, anime_id):
+                parent_fd = directory_fds[-1]
+                try:
+                    os.mkdir(component, mode=0o755, dir_fd=parent_fd)
+                except FileExistsError:
+                    pass
+                else:
+                    os.fsync(parent_fd)
+                directory_fds.append(
+                    os.open(component, directory_flags, dir_fd=parent_fd)
+                )
+            destination_fd = directory_fds[-1]
             self._claim_destination_source(destination_fd, serv)
-            return destination_fd
+            return directory_fds
         except Exception:
-            os.close(destination_fd)
+            for directory_fd in reversed(directory_fds):
+                os.close(directory_fd)
             raise
 
     @staticmethod
@@ -382,24 +397,52 @@ class BatchDownloadManager:
         try:
             marker_fd = os.open(marker_name, marker_flags, dir_fd=destination_fd)
         except FileNotFoundError:
+            temporary_name = f".kodik-source-{uuid.uuid4().hex}.tmp"
+            temporary_fd = None
             try:
-                marker_fd = os.open(
-                    marker_name,
+                temporary_fd = os.open(
+                    temporary_name,
                     os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                     0o644,
                     dir_fd=destination_fd,
                 )
-            except FileExistsError:
-                marker_fd = os.open(marker_name, marker_flags, dir_fd=destination_fd)
-            else:
+                marker_data = (serv + "\n").encode("ascii")
                 try:
-                    os.write(marker_fd, (serv + "\n").encode("ascii"))
-                    os.fsync(marker_fd)
+                    with os.fdopen(temporary_fd, "wb") as temporary:
+                        temporary_fd = None
+                        temporary.write(marker_data)
+                        temporary.flush()
+                        os.fsync(temporary.fileno())
+                    try:
+                        os.link(
+                            temporary_name,
+                            marker_name,
+                            src_dir_fd=destination_fd,
+                            dst_dir_fd=destination_fd,
+                            follow_symlinks=False,
+                        )
+                    except FileExistsError:
+                        pass
+                    else:
+                        os.fsync(destination_fd)
                 finally:
-                    os.close(marker_fd)
-                os.fsync(destination_fd)
-                return
+                    if temporary_fd is not None:
+                        os.close(temporary_fd)
+                    os.unlink(temporary_name, dir_fd=destination_fd)
+                    os.fsync(destination_fd)
+                marker_fd = os.open(marker_name, marker_flags, dir_fd=destination_fd)
+            except Exception:
+                if temporary_fd is not None:
+                    os.close(temporary_fd)
+                try:
+                    os.unlink(temporary_name, dir_fd=destination_fd)
+                except FileNotFoundError:
+                    pass
+                raise
         try:
+            marker_stat = os.fstat(marker_fd)
+            if not stat.S_ISREG(marker_stat.st_mode) or marker_stat.st_size <= 0:
+                raise ValueError("anime destination source marker is invalid")
             existing_serv = os.read(marker_fd, 16).decode("ascii", errors="strict").strip()
         finally:
             os.close(marker_fd)
@@ -407,6 +450,7 @@ class BatchDownloadManager:
             raise ValueError(
                 f"anime destination belongs to source {existing_serv!r}, not {serv!r}"
             )
+        os.fsync(destination_fd)
 
     @staticmethod
     def _is_nonempty_regular_file(directory_fd: int, filename: str) -> bool:
@@ -417,23 +461,42 @@ class BatchDownloadManager:
         return stat.S_ISREG(file_stat.st_mode) and file_stat.st_size > 0
 
     @staticmethod
-    def _episode_filename(episode: int, translation: str, quality: str, width: int) -> str:
+    def _episode_filename(
+        episode: int,
+        translation_id: str,
+        translation: str,
+        quality: str,
+        width: int,
+    ) -> str:
         safe_translation = re.sub(r'[<>:"/\\|?*\x00-\x1f\x7f]+', "_", translation)
         safe_translation = re.sub(r"\s+", " ", safe_translation).strip(" ._") or "Translation"
+        safe_id = re.sub(r'[^A-Za-z0-9._-]+', "_", str(translation_id)).strip(" ._") or "id"
+        safe_id = safe_id[:32].rstrip(" ._") or "id"
+        id_digest = hashlib.sha256(str(translation_id).encode("utf-8")).hexdigest()[:16]
+        id_token = f" [{safe_id}-{id_digest}]"
         prefix = "Movie - " if episode == 0 else f"S01E{episode:0{width}d} - "
         suffix = f" - {quality}p.mp4"
-        max_translation_bytes = 255 - len(prefix.encode("utf-8")) - len(suffix.encode("utf-8"))
+        max_translation_bytes = (
+            255
+            - len(prefix.encode("utf-8"))
+            - len(id_token.encode("utf-8"))
+            - len(suffix.encode("utf-8"))
+        )
         encoded = safe_translation.encode("utf-8")[:max_translation_bytes]
         safe_translation = encoded.decode("utf-8", errors="ignore").rstrip(" ._") or "Translation"
-        return f"{prefix}{safe_translation}{suffix}"
+        return f"{prefix}{safe_translation}{id_token}{suffix}"
 
     @staticmethod
-    def _atomic_publish(source: Path, destination_fd: int, destination_name: str) -> bool:
+    def _atomic_publish(source, destination_fd: int, destination_name: str) -> bool:
         temporary_name = f".batch-{uuid.uuid4().hex}.part"
         source_fd = None
         temporary_fd = None
         try:
-            source_fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
+            if hasattr(source, "fileno"):
+                source_fd = os.dup(source.fileno())
+                os.lseek(source_fd, 0, os.SEEK_SET)
+            else:
+                source_fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
             source_stat = os.fstat(source_fd)
             if not stat.S_ISREG(source_stat.st_mode) or source_stat.st_size <= 0:
                 raise ValueError("downloaded source must be a non-empty regular file")
@@ -458,6 +521,19 @@ class BatchDownloadManager:
                     follow_symlinks=False,
                 )
             except FileExistsError:
+                try:
+                    winner_stat = os.stat(
+                        destination_name,
+                        dir_fd=destination_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError as exc:
+                    raise ValueError("published destination winner disappeared") from exc
+                if not stat.S_ISREG(winner_stat.st_mode) or winner_stat.st_size <= 0:
+                    raise ValueError(
+                        "published destination winner is not a non-empty regular file"
+                    )
+                os.fsync(destination_fd)
                 return False
             os.fsync(destination_fd)
             os.unlink(
@@ -477,12 +553,14 @@ class BatchDownloadManager:
                     os.unlink(temporary_name, dir_fd=destination_fd)
                 except FileNotFoundError:
                     pass
+                else:
+                    os.fsync(destination_fd)
 
     @staticmethod
-    def _default_episode_downloader(**request) -> Path:
-        from fast_download import fast_download, get_path
+    def _default_episode_downloader(**request):
+        from fast_download import fast_download_open
 
-        download_hash, _ = fast_download(
+        _download_hash, _, source = fast_download_open(
             request["anime_id"],
             request["serv"],
             request["episode"],
@@ -491,4 +569,4 @@ class BatchDownloadManager:
             request["token"],
             metadata=request["metadata"],
         )
-        return Path(get_path(download_hash))
+        return source

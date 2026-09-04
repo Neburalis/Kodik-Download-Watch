@@ -1,10 +1,10 @@
 import json
 import os
+import tempfile
 import threading
 import time
 import unittest
 from pathlib import Path
-from tempfile import TemporaryDirectory
 from unittest import mock
 
 import batch_download
@@ -13,6 +13,10 @@ from batch_download import (
     BatchQueueFullError,
     validate_batch_selection,
 )
+
+
+def TemporaryDirectory():
+    return tempfile.TemporaryDirectory(dir=Path(tempfile.gettempdir()).resolve())
 
 
 class BatchSelectionValidationTests(unittest.TestCase):
@@ -36,6 +40,19 @@ class BatchSelectionValidationTests(unittest.TestCase):
             validate_batch_selection(self.serial_data, "610", 0, 24)
         with self.assertRaises(ValueError):
             validate_batch_selection(self.serial_data, "610", 1, 25)
+
+    def test_rejects_translation_range_beyond_title_series_count(self):
+        serial_data = {
+            "series_count": 2,
+            "translations": [
+                {"id": "610", "name": "AniLibria.TV", "series_range": [1, 99]},
+            ],
+        }
+
+        translation = validate_batch_selection(serial_data, "610", 1, 2)
+        self.assertEqual(translation["id"], "610")
+        with self.assertRaises(ValueError):
+            validate_batch_selection(serial_data, "610", 3, 3)
 
     def test_accepts_episode_zero_for_movie_metadata(self):
         movie_data = {
@@ -81,7 +98,7 @@ class BatchDownloadManagerTests(unittest.TestCase):
             )
             status = self.wait_for_terminal_status(manager, job_id)
 
-            output = Path(root) / "123" / "S01E01 - AniLibria.TV - 720p.mp4"
+            output = Path(root) / "123" / "S01E01 - AniLibria.TV [610-01ce4b291ad3ecd2] - 720p.mp4"
             self.assertEqual(output.read_bytes(), b"video-data")
             self.assertEqual(output.stat().st_mode & 0o777, 0o644)
             self.assertEqual(status["status"], "completed")
@@ -112,6 +129,25 @@ class BatchDownloadManagerTests(unittest.TestCase):
             json.dumps(status)
             manager.shutdown()
 
+    def test_copies_an_open_source_after_its_path_is_removed(self):
+        with TemporaryDirectory() as root, TemporaryDirectory() as sources:
+            source_path = Path(sources) / "download.mp4"
+            source_path.write_bytes(b"video-data")
+
+            def downloader(**request):
+                source = source_path.open("rb")
+                source_path.unlink()
+                return source
+
+            manager = BatchDownloadManager(root, episode_downloader=downloader)
+            job_id = manager.start_job("sh", "123", "610", "Dub", "720", [1])
+            status = self.wait_for_terminal_status(manager, job_id)
+
+            output = Path(root) / "123" / "S01E01 - Dub [610-01ce4b291ad3ecd2] - 720p.mp4"
+            self.assertEqual(status["status"], "completed")
+            self.assertEqual(output.read_bytes(), b"video-data")
+            manager.shutdown()
+
     def test_rejects_unsafe_anime_ids_before_scheduling(self):
         with TemporaryDirectory() as root:
             manager = BatchDownloadManager(root, episode_downloader=lambda **request: None)
@@ -131,6 +167,71 @@ class BatchDownloadManagerTests(unittest.TestCase):
                     manager.start_job("sh", "123", "610", "Dub", "720", [1])
             finally:
                 manager.shutdown()
+
+    def test_rejects_symlinked_ancestor_of_configured_media_root(self):
+        with TemporaryDirectory() as parent, TemporaryDirectory() as outside:
+            configured_parent = Path(parent) / "configured"
+            configured_parent.mkdir()
+            (configured_parent / "linked").symlink_to(outside, target_is_directory=True)
+            media_root = configured_parent / "linked" / "shows"
+            manager = BatchDownloadManager(
+                media_root, episode_downloader=lambda **request: Path(outside)
+            )
+
+            job_id = manager.start_job("sh", "123", "610", "Dub", "720", [1])
+            status = self.wait_for_terminal_status(manager, job_id)
+
+            self.assertEqual(status["status"], "completed_with_errors")
+            self.assertEqual(status["episodes"][0]["state"], "failed")
+            self.assertFalse((Path(outside) / "shows").exists())
+            manager.shutdown()
+
+    def test_media_root_creation_fsyncs_each_parent_before_descending(self):
+        with TemporaryDirectory() as parent, TemporaryDirectory() as sources:
+            source = Path(sources) / "source.mp4"
+            source.write_bytes(b"video")
+            media_root = Path(parent).resolve() / "level-one" / "level-two"
+            events = []
+            directory_fds = {}
+            original_mkdir = os.mkdir
+            original_open = os.open
+            original_fsync = os.fsync
+
+            def track_mkdir(path, mode=0o777, *, dir_fd=None):
+                if path in {"level-one", "level-two", "123"}:
+                    events.append(f"mkdir:{path}")
+                return original_mkdir(path, mode, dir_fd=dir_fd)
+
+            def track_open(path, flags, mode=0o777, *, dir_fd=None):
+                result = original_open(path, flags, mode, dir_fd=dir_fd)
+                if path in {"level-one", "level-two", "123"}:
+                    events.append(f"open:{path}")
+                    directory_fds[path] = result
+                return result
+
+            def track_fsync(file_descriptor):
+                events.append("fsync")
+                return original_fsync(file_descriptor)
+
+            def downloader(**request):
+                for file_descriptor in directory_fds.values():
+                    os.fstat(file_descriptor)
+                return source
+
+            manager = BatchDownloadManager(media_root, episode_downloader=downloader)
+            with mock.patch.object(batch_download.os, "mkdir", side_effect=track_mkdir), \
+                    mock.patch.object(batch_download.os, "open", side_effect=track_open), \
+                    mock.patch.object(batch_download.os, "fsync", side_effect=track_fsync):
+                job_id = manager.start_job("sh", "123", "610", "Dub", "720", [1])
+                status = self.wait_for_terminal_status(manager, job_id)
+
+            for component in ("level-one", "level-two", "123"):
+                mkdir_index = events.index(f"mkdir:{component}")
+                open_index = events.index(f"open:{component}")
+                self.assertEqual(events[mkdir_index + 1], "fsync")
+                self.assertLess(mkdir_index, open_index)
+            self.assertEqual(status["status"], "completed")
+            manager.shutdown()
 
     def test_rejects_destination_symlink_created_while_job_is_queued(self):
         with TemporaryDirectory() as root, TemporaryDirectory() as outside, TemporaryDirectory() as sources:
@@ -181,6 +282,79 @@ class BatchDownloadManagerTests(unittest.TestCase):
             self.assertEqual(calls, ["sh"])
             self.assertEqual((Path(root) / "same-id" / ".kodik-source").read_text(), "sh\n")
             manager.shutdown()
+
+    def test_source_marker_is_complete_before_atomic_publication(self):
+        with TemporaryDirectory() as root:
+            directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            original_link = os.link
+            observed = []
+
+            def inspect_link(source, destination, **kwargs):
+                with open(Path(root) / source, "rb") as temporary:
+                    observed.append(temporary.read())
+                self.assertFalse((Path(root) / destination).exists())
+                return original_link(source, destination, **kwargs)
+
+            try:
+                with mock.patch.object(batch_download.os, "link", side_effect=inspect_link):
+                    BatchDownloadManager._claim_destination_source(directory_fd, "sh")
+            finally:
+                os.close(directory_fd)
+
+            self.assertEqual(observed, [b"sh\n"])
+            self.assertEqual((Path(root) / ".kodik-source").read_bytes(), b"sh\n")
+            self.assertEqual([path.name for path in Path(root).iterdir()], [".kodik-source"])
+
+    def test_source_marker_accepts_concurrent_same_source_winner(self):
+        with TemporaryDirectory() as root:
+            directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            calls = []
+
+            def publish_winner(_source, destination, **kwargs):
+                calls.append(destination)
+                (Path(root) / destination).write_bytes(b"sh\n")
+                raise FileExistsError(destination)
+
+            try:
+                with mock.patch.object(batch_download.os, "link", side_effect=publish_winner):
+                    BatchDownloadManager._claim_destination_source(directory_fd, "sh")
+            finally:
+                os.close(directory_fd)
+
+            self.assertEqual(calls, [".kodik-source"])
+            self.assertEqual((Path(root) / ".kodik-source").read_bytes(), b"sh\n")
+
+    def test_source_marker_retry_retries_directory_durability(self):
+        with TemporaryDirectory() as root:
+            directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            original_fsync = os.fsync
+            directory_syncs = 0
+
+            def fail_first_directory_sync(file_descriptor):
+                nonlocal directory_syncs
+                if batch_download.stat.S_ISDIR(os.fstat(file_descriptor).st_mode):
+                    directory_syncs += 1
+                    if directory_syncs == 1:
+                        raise OSError("post-link fsync failed")
+                return original_fsync(file_descriptor)
+
+            try:
+                with mock.patch.object(
+                    batch_download.os, "fsync", side_effect=fail_first_directory_sync
+                ):
+                    with self.assertRaisesRegex(OSError, "post-link fsync failed"):
+                        BatchDownloadManager._claim_destination_source(directory_fd, "sh")
+
+                self.assertEqual((Path(root) / ".kodik-source").read_bytes(), b"sh\n")
+                with mock.patch.object(
+                    batch_download.os,
+                    "fsync",
+                    side_effect=OSError("retry fsync failed"),
+                ):
+                    with self.assertRaisesRegex(OSError, "retry fsync failed"):
+                        BatchDownloadManager._claim_destination_source(directory_fd, "sh")
+            finally:
+                os.close(directory_fd)
 
     def test_forwards_episode_specific_media_metadata_to_downloader(self):
         with TemporaryDirectory() as root, TemporaryDirectory() as sources:
@@ -234,7 +408,7 @@ class BatchDownloadManagerTests(unittest.TestCase):
         with TemporaryDirectory() as root:
             destination = Path(root) / "123"
             destination.mkdir()
-            output = destination / "S01E01 - Dub - 720p.mp4"
+            output = destination / "S01E01 - Dub [610-01ce4b291ad3ecd2] - 720p.mp4"
             output.write_bytes(b"existing")
             calls = []
 
@@ -281,7 +455,7 @@ class BatchDownloadManagerTests(unittest.TestCase):
             self.assertIsNone(status["current_episode"])
             self.assertEqual([item["state"] for item in status["episodes"]], ["completed", "failed", "completed"])
             self.assertEqual(status["episodes"][1]["error"], "upstream unavailable")
-            self.assertFalse((Path(root) / "123" / "S01E02 - Dub - 480p.mp4").exists())
+            self.assertFalse((Path(root) / "123" / "S01E02 - Dub [610-01ce4b291ad3ecd2] - 480p.mp4").exists())
             manager.shutdown()
 
     def test_sanitizes_translation_component_in_final_filename(self):
@@ -293,7 +467,7 @@ class BatchDownloadManagerTests(unittest.TestCase):
             job_id = manager.start_job("sh", "123", "610", ' Dub/Bad:*?"<>|\n ', "360", [1])
             status = self.wait_for_terminal_status(manager, job_id)
 
-            output = Path(root) / "123" / "S01E01 - Dub_Bad - 360p.mp4"
+            output = Path(root) / "123" / "S01E01 - Dub_Bad [610-01ce4b291ad3ecd2] - 360p.mp4"
             self.assertTrue(output.is_file())
             self.assertEqual(status["translation"], ' Dub/Bad:*?"<>|\n ')
             self.assertEqual(status["episodes"][0]["file"], str(output))
@@ -314,6 +488,31 @@ class BatchDownloadManagerTests(unittest.TestCase):
             self.assertEqual(file_path.read_bytes(), b"video")
             manager.shutdown()
 
+    def test_translation_ids_prevent_sanitized_and_truncated_filename_collisions(self):
+        with TemporaryDirectory() as root, TemporaryDirectory() as sources:
+            source = Path(sources) / "source.mp4"
+            source.write_bytes(b"video")
+            manager = BatchDownloadManager(
+                root, episode_downloader=lambda **request: source, max_active_jobs=4
+            )
+
+            jobs = [
+                manager.start_job("sh", "123", "dub/one", "Same/Name", "720", [1]),
+                manager.start_job("sh", "123", "dub:two", "Same:Name", "720", [1]),
+                manager.start_job("sh", "123", "long-one", "Я" * 300 + "A", "720", [2]),
+                manager.start_job("sh", "123", "long-two", "Я" * 300 + "B", "720", [2]),
+            ]
+            statuses = [self.wait_for_terminal_status(manager, job) for job in jobs]
+
+            filenames = [Path(status["episodes"][0]["file"]).name for status in statuses]
+            self.assertEqual(len(set(filenames)), 4)
+            self.assertTrue(all(status["completed_count"] == 1 for status in statuses))
+            self.assertTrue(all(status["skipped_count"] == 0 for status in statuses))
+            self.assertTrue(all(len(name.encode("utf-8")) <= 255 for name in filenames))
+            self.assertTrue(any("dub_one" in name for name in filenames))
+            self.assertTrue(any("dub_two" in name for name in filenames))
+            manager.shutdown()
+
     def test_episode_zero_uses_movie_filename(self):
         with TemporaryDirectory() as root, TemporaryDirectory() as sources:
             source = Path(sources) / "movie.mp4"
@@ -323,7 +522,7 @@ class BatchDownloadManagerTests(unittest.TestCase):
             job_id = manager.start_job("kp", "42", "7", "Original", "720", [0])
             status = self.wait_for_terminal_status(manager, job_id)
 
-            output = Path(root) / "42" / "Movie - Original - 720p.mp4"
+            output = Path(root) / "42" / "Movie - Original [7-7902699be42c8a8e] - 720p.mp4"
             self.assertEqual(output.read_bytes(), b"movie")
             self.assertEqual(status["episodes"][0]["file"], str(output))
             manager.shutdown()
@@ -421,12 +620,19 @@ class BatchDownloadManagerTests(unittest.TestCase):
             source.write_bytes(b"video")
             manager = BatchDownloadManager(root, episode_downloader=lambda **request: source)
 
-            with mock.patch("batch_download.os.link", side_effect=OSError("disk failure")):
+            original_link = os.link
+
+            def fail_episode_link(source_name, destination_name, **kwargs):
+                if source_name.startswith(".batch-"):
+                    raise OSError("disk failure")
+                return original_link(source_name, destination_name, **kwargs)
+
+            with mock.patch("batch_download.os.link", side_effect=fail_episode_link):
                 job_id = manager.start_job("sh", "123", "610", "Dub", "720", [1])
                 status = self.wait_for_terminal_status(manager, job_id)
 
             destination = Path(root) / "123"
-            final = destination / "S01E01 - Dub - 720p.mp4"
+            final = destination / "S01E01 - Dub [610-01ce4b291ad3ecd2] - 720p.mp4"
             self.assertEqual(status["episodes"][0]["state"], "failed")
             self.assertEqual(status["episodes"][0]["error"], "disk failure")
             self.assertFalse(final.exists())
@@ -445,23 +651,91 @@ class BatchDownloadManagerTests(unittest.TestCase):
             def downloader(**request):
                 destination.mkdir(exist_ok=True)
                 (destination / ".kodik-source").write_text("sh\n", encoding="ascii")
-                (destination / "S01E01 - Dub - 720p.mp4").write_bytes(b"existing")
+                (destination / "S01E01 - Dub [610-01ce4b291ad3ecd2] - 720p.mp4").write_bytes(b"existing")
                 return source
 
             manager = BatchDownloadManager(root, episode_downloader=downloader)
             job_id = manager.start_job("sh", "123", "610", "Dub", "720", [1])
             status = self.wait_for_terminal_status(manager, job_id)
 
-            final = destination / "S01E01 - Dub - 720p.mp4"
+            final = destination / "S01E01 - Dub [610-01ce4b291ad3ecd2] - 720p.mp4"
             self.assertEqual(final.read_bytes(), b"existing")
             self.assertEqual(status["episodes"][0]["state"], "skipped")
             self.assertEqual(status["skipped_count"], 1)
             self.assertEqual(status["completed_count"], 0)
             self.assertEqual(
                 sorted(path.name for path in destination.iterdir()),
-                [".kodik-source", "S01E01 - Dub - 720p.mp4"],
+                [".kodik-source", "S01E01 - Dub [610-01ce4b291ad3ecd2] - 720p.mp4"],
             )
             manager.shutdown()
+
+    def test_atomic_publish_rejects_unusable_existing_winner(self):
+        creators = {
+            "empty": lambda path, _target: path.write_bytes(b""),
+            "symlink": lambda path, target: path.symlink_to(target),
+            "directory": lambda path, _target: path.mkdir(),
+        }
+        for name, create_winner in creators.items():
+            with self.subTest(winner=name), TemporaryDirectory() as root, TemporaryDirectory() as sources:
+                source = Path(sources) / "source.mp4"
+                source.write_bytes(b"new")
+                target = Path(sources) / "target.mp4"
+                target.write_bytes(b"target")
+                final = Path(root) / "final.mp4"
+                create_winner(final, target)
+                directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    with self.assertRaises(ValueError):
+                        BatchDownloadManager._atomic_publish(source, directory_fd, final.name)
+                finally:
+                    os.close(directory_fd)
+
+    def test_atomic_publish_syncs_directory_for_existing_winner(self):
+        with TemporaryDirectory() as root, TemporaryDirectory() as sources:
+            source = Path(sources) / "source.mp4"
+            source.write_bytes(b"new")
+            (Path(root) / "final.mp4").write_bytes(b"winner")
+            directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            synced = []
+            original_fsync = os.fsync
+
+            def track_fsync(file_descriptor):
+                synced.append(file_descriptor)
+                return original_fsync(file_descriptor)
+
+            try:
+                with mock.patch.object(batch_download.os, "fsync", side_effect=track_fsync):
+                    published = BatchDownloadManager._atomic_publish(
+                        source, directory_fd, "final.mp4"
+                    )
+            finally:
+                os.close(directory_fd)
+
+            self.assertFalse(published)
+            self.assertIn(directory_fd, synced)
+
+    def test_atomic_publish_syncs_directory_after_failed_cleanup(self):
+        with TemporaryDirectory() as root, TemporaryDirectory() as sources:
+            source = Path(sources) / "source.mp4"
+            source.write_bytes(b"new")
+            directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            synced = []
+            original_fsync = os.fsync
+
+            def track_fsync(file_descriptor):
+                synced.append(file_descriptor)
+                return original_fsync(file_descriptor)
+
+            try:
+                with mock.patch.object(
+                    batch_download.os, "link", side_effect=OSError("disk failure")
+                ), mock.patch.object(batch_download.os, "fsync", side_effect=track_fsync):
+                    with self.assertRaisesRegex(OSError, "disk failure"):
+                        BatchDownloadManager._atomic_publish(source, directory_fd, "final.mp4")
+            finally:
+                os.close(directory_fd)
+
+            self.assertIn(directory_fd, synced)
 
     def test_destination_creation_failure_finishes_job_with_errors(self):
         with TemporaryDirectory() as parent:
@@ -529,8 +803,8 @@ class BatchDownloadManagerTests(unittest.TestCase):
             self.wait_for_terminal_status(manager, job_id)
 
             destination = Path(root) / "123"
-            self.assertTrue((destination / "S01E001 - Dub - 720p.mp4").is_file())
-            self.assertTrue((destination / "S01E100 - Dub - 720p.mp4").is_file())
+            self.assertTrue((destination / "S01E001 - Dub [610-01ce4b291ad3ecd2] - 720p.mp4").is_file())
+            self.assertTrue((destination / "S01E100 - Dub [610-01ce4b291ad3ecd2] - 720p.mp4").is_file())
             manager.shutdown()
 
 
