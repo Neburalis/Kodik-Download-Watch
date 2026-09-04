@@ -95,6 +95,25 @@ class MainRuntimeTests(unittest.TestCase):
             download_name="Серия-01-Перевод-Неизвестно-720p.mp4",
         )
 
+    def test_fast_download_caches_parser_url_and_skip_segments(self):
+        fast_download = types.ModuleType("fast_download")
+        link_data = ("//cdn.example/", ["360", "720"], [[0, 90], [1300, 1400]])
+        fast_download.fast_download = mock.Mock(return_value=("hash~", link_data))
+        fast_download.get_path = mock.Mock(return_value="tmp/hash~/result.mp4")
+        cache = mock.Mock()
+        with mock.patch.object(self.main, "ch_save", True), mock.patch.object(
+            self.main, "ch", cache, create=True
+        ), mock.patch.object(
+            self.main.config, "USE_SAVED_DATA", False
+        ), mock.patch.object(
+            self.main, "_get_download_media_metadata", return_value={}
+        ), mock.patch.dict(sys.modules, {"fast_download": fast_download}):
+            self.main.fast_download_work("sh", "17895", 1, "610", "720", 12)
+
+        cache.add_seria.assert_called_once_with(
+            "sh17895", "610", 1, "//cdn.example/", [[0, 90], [1300, 1400]]
+        )
+
     def test_batch_accepts_translation_returned_by_fresh_kodik_data(self):
         payload = {
             "serv": "kp",

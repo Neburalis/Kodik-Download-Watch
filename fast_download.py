@@ -75,7 +75,7 @@ def _download_lock(hsh: str):
             if entry["users"] == 0 and _download_locks.get(hsh) is entry:
                 _download_locks.pop(hsh, None)
 
-def fast_download(id: str, id_type: str, seria_num: int, translation_id: str, quality: str, token: str, filename: str = 'result', metadata: dict | None = None) -> tuple[str, str | None]:
+def fast_download(id: str, id_type: str, seria_num: int, translation_id: str, quality: str, token: str, filename: str = 'result', metadata: dict | None = None) -> tuple[str, tuple | None]:
     """
     Эта функция обеспечивает быструю загрузку засчет параллельной загрузки нескольких фрагментов.
     :id: Id сериала на Шикимори/Кинопоиске
@@ -104,7 +104,7 @@ def _fast_download_locked(
     filename: str,
     metadata: dict,
     hsh: str,
-) -> tuple[str, str | None]:
+) -> tuple[str, tuple | None]:
     cache_root = os.path.join('tmp', hsh)
     os.makedirs('tmp', exist_ok=True)
     if os.path.isdir(cache_root):
@@ -124,9 +124,10 @@ def _fast_download_locked(
             request_id_type = 'shikimori'
         elif request_id_type == 'kp':
             request_id_type = 'kinopoisk'
-        link = get_download_link(
+        link_data = get_download_link(
             id, request_id_type, seria_num, translation_id, token
-        )[0]
+        )
+        link = link_data[0]
         manifest_url = 'https:' + link + quality + '.mp4:hls:manifest.m3u8'
         manifest = get_url_data_with_retries(manifest_url)
         segments = get_segments(manifest, 'https:' + link)
@@ -167,7 +168,7 @@ def _fast_download_locked(
                 artifact_path = os.path.join(cache_root, artifact)
                 if os.path.isfile(artifact_path) or os.path.islink(artifact_path):
                     os.remove(artifact_path)
-        return (hsh, link)
+        return (hsh, link_data)
     except Exception:
         shutil.rmtree(cache_root, ignore_errors=True)
         raise

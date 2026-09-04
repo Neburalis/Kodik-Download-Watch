@@ -304,7 +304,7 @@ file /tmp/owned.ts
             os.chdir(directory)
             try:
                 result = fast_download.fast_download("1", "sh", 1, "610", "720", None)
-                self.assertEqual(result[1], "//cdn.example/")
+                self.assertEqual(result[1], ("//cdn.example/", None, []))
                 self.assertEqual(request_get.call_count, 2)
                 request_get.assert_called_with(
                     "https://cdn.example/720.mp4:hls:manifest.m3u8", timeout=30
@@ -364,7 +364,8 @@ file /tmp/owned.ts
                 self.assertEqual(errors, [])
                 self.assertEqual(get_download_link.call_count, 1)
                 self.assertEqual(len(results), 2)
-                self.assertEqual({result[1] for result in results}, {"//cdn.example/", None})
+                self.assertIn(("//cdn.example/", None, []), [result[1] for result in results])
+                self.assertIn(None, [result[1] for result in results])
             finally:
                 release_download.set()
                 os.chdir(previous_directory)
@@ -487,7 +488,7 @@ with fast_download._download_lock("shared"):
 
                 result = fast_download.fast_download("1", "sh", 1, "610", "720", None)
 
-                self.assertEqual(result, (expected_hash, "//cdn.example/"))
+                self.assertEqual(result, (expected_hash, ("//cdn.example/", None, [])))
                 self.assertEqual(get_download_link.call_count, 1)
                 self.assertEqual((cached_directory / "result.mp4").read_bytes(), b"video")
             finally:

@@ -564,12 +564,18 @@ def fast_download_work(id_type: str, id: str, seria_num: int, translation_id: st
         .replace('»', '\'').replace('«', '\'').replace('„', '\'').replace('“', '\'').replace('<', '[') \
         .replace(']', ')').replace('|', '-').replace('--', '-').replace('--', '-')
     try:
-        hsh, link = fast_download(id, id_type, seria_num, translation_id, quality, config.KODIK_TOKEN,
+        hsh, link_data = fast_download(id, id_type, seria_num, translation_id, quality, config.KODIK_TOKEN,
                             filename=fname, metadata=metadata)
-        if ch_save and link is not None:
+        if ch_save and link_data is not None:
             try:
                 # Попытка записать данные к уже имеющимся данным
-                ch.add_seria("kp"+id, translation_id, seria_num, link)
+                ch.add_seria(
+                    id_type+id,
+                    translation_id,
+                    seria_num,
+                    link_data[0],
+                    link_data[2],
+                )
             except KeyError:
                 pass
         return send_file(get_path(hsh), as_attachment=True, download_name=fname+'.mp4')
