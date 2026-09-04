@@ -4,4 +4,5 @@ cache.json
 .vscode
 test.*
 tmp/*
+.tmp-locks/
 __pycache__/

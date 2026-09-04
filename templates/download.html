@@ -20,7 +20,44 @@
     <div class="container mt-5">
       <h1 class="mb-4">Скачивание:</h1>
       <p>Если у вас не получается скачать, попробуйте выбрать другое качество.</p>
-      {% if series != 0 %}
+      {% if series != 0 and series[1] >= series[0] %}
+        <section
+          id="batch-download-panel"
+          class="card {% if is_dark %}dark-body border-secondary{% endif %} mb-4"
+          data-serv="{{ serv }}"
+          data-anime-id="{{ anime_id }}"
+          data-translation-id="{{ translation_id }}"
+          data-first-episode="{{ series[0] }}"
+          data-last-episode="{{ series[1] }}"
+          data-start-url="{{ url_for('start_batch_download') }}"
+          data-status-url-template="{{ url_for('batch_download_status', job_id='__JOB_ID__') }}"
+        >
+          <!-- Status endpoint shape: /batch_download/status/__JOB_ID__/ -->
+          <div class="card-body">
+            <h2 class="h5 card-title">Скачать все серии на сервер</h2>
+            <div class="btn-group mb-3" role="group" aria-label="Выбор качества для пакетной загрузки">
+              <button type="button" class="btn {% if is_dark %}dark-{% endif %}btn-primary batch-download-button" data-quality="720">720</button>
+              <button type="button" class="btn {% if is_dark %}dark-{% endif %}btn-primary batch-download-button" data-quality="480">480</button>
+              <button type="button" class="btn {% if is_dark %}dark-{% endif %}btn-primary batch-download-button" data-quality="360">360</button>
+            </div>
+            <div id="batch-status-panel" class="d-none" aria-live="polite">
+              <div class="progress mb-2" role="progressbar" aria-label="Прогресс пакетной загрузки" aria-valuemin="0" aria-valuemax="100">
+                <div id="batch-progress" class="progress-bar" style="width: 0%" aria-valuenow="0">0%</div>
+              </div>
+              <p id="batch-summary" class="mb-1"></p>
+              <p id="batch-current" class="mb-1"></p>
+              <p id="batch-destination" class="mb-2"></p>
+              <div class="table-responsive">
+                <table class="table table-sm {% if is_dark %}table-dark{% endif %}">
+                  <thead>
+                    <tr><th>Серия</th><th>Статус</th></tr>
+                  </thead>
+                  <tbody id="batch-episodes"></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </section>
         <table>
           <thead>
             <tr>
@@ -60,5 +97,6 @@
     </div>
     <!-- Скрипты Bootstrap 5 -->
     <script src="{{ url_for('static', filename='js/bootstrap.min.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/batch_download.js') }}"></script>
   </body>
 </html>
