@@ -1,8 +1,10 @@
-from flask import Flask, render_template, request, redirect, abort, session, send_file, g
+from flask import Flask, render_template, request, redirect, abort, session, send_file, g, jsonify
 from flask_socketio import SocketIO, send, emit, join_room, leave_room
 from flask_mobility import Mobility
 from getters import *
-from fast_download import clear_tmp, fast_download, get_path
+from fast_download import fast_download, get_path
+from batch_download import BatchDownloadManager, BatchQueueFullError, validate_batch_selection
+from shikimori_metadata import build_mp4_metadata, fetch_shikimori_metadata
 import watch_together
 from json import load
 import config
@@ -26,9 +28,7 @@ ch_save = config.SAVE_DATA
 ch_use = config.USE_SAVED_DATA
 
 watch_manager = watch_together.Manager(config.REMOVE_TIME)
-
-# Очистка tmp
-clear_tmp()
+batch_download_manager = BatchDownloadManager(config.ANIME_DIRECTORY)
 
 # Проверка доступности шикимори
 test_shiki()
@@ -176,8 +176,115 @@ def download_choose_seria(serv, id, data):
         series = 0
     else:
         series = [int(x) for x in data[0].split(":")]
+    translation_id = str(data[1])
     return render_template('download.html', series=series, backlink=f"/download/{serv}/{id}/",
+                           serv=serv, anime_id=id, translation_id=translation_id,
                            is_dark=session['is_dark'] if "is_dark" in session.keys() else False, is_mobile=g.is_mobile)
+
+def _get_batch_serial_data(serv, anime_id):
+    if serv not in {"sh", "kp"}:
+        raise ValueError("Неизвестный источник аниме")
+    cache_key = serv + anime_id
+    if ch_use and ch.is_id(cache_key):
+        cached = ch.get_data_by_id(cache_key)
+        serial_data = cached.get("serial_data") if isinstance(cached, dict) else None
+        if isinstance(serial_data, dict) and serial_data:
+            return serial_data
+    id_type = "shikimori" if serv == "sh" else "kinopoisk"
+    return get_serial_info(anime_id, id_type, token)
+
+
+def _get_download_media_metadata(serv, anime_id, episode, translation_name):
+    if serv != "sh":
+        return {}
+    shikimori_data = fetch_shikimori_metadata(anime_id)
+    return build_mp4_metadata(
+        shikimori_data,
+        anime_id=anime_id,
+        episode=episode,
+        translation=translation_name,
+    )
+
+
+@app.route('/batch_download/start/', methods=['POST'])
+def start_batch_download():
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify(error='Ожидается JSON-объект'), 400
+    required = ('serv', 'anime_id', 'translation_id', 'quality', 'first_episode', 'last_episode')
+    missing = [field for field in required if field not in payload]
+    if missing:
+        return jsonify(error='Отсутствуют поля: '+', '.join(missing)), 400
+    try:
+        if type(payload['first_episode']) is not int or type(payload['last_episode']) is not int:
+            raise TypeError('Номера серий должны быть целыми числами')
+        for field in ('serv', 'anime_id', 'translation_id', 'quality'):
+            if not isinstance(payload[field], str) or not payload[field].strip():
+                raise TypeError(f'Поле {field} должно быть непустой строкой')
+        first_episode = payload['first_episode']
+        last_episode = payload['last_episode']
+        if first_episode < 0 or last_episode < first_episode:
+            raise ValueError('Некорректный диапазон серий')
+        if last_episode - first_episode + 1 > config.MAX_BATCH_EPISODES:
+            raise ValueError(
+                f'За один раз можно поставить в очередь не более {config.MAX_BATCH_EPISODES} серий'
+            )
+        serv = payload['serv']
+        anime_id = payload['anime_id']
+        translation_id = payload['translation_id']
+        quality = payload['quality']
+        try:
+            serial_data = _get_batch_serial_data(serv, anime_id)
+        except ValueError:
+            raise
+        except Exception:
+            return jsonify(error='Не удалось проверить данные аниме на сервере'), 502
+        translation = validate_batch_selection(
+            serial_data,
+            translation_id,
+            first_episode,
+            last_episode,
+        )
+        translation_name = translation.get('name') or translations.get(translation_id, 'Неизвестно')
+        try:
+            media_metadata = _get_download_media_metadata(
+                serv,
+                anime_id,
+                0,
+                translation_name,
+            )
+        except Exception:
+            return jsonify(error='Не удалось получить метаданные Shikimori'), 502
+        anime_title = None
+        if ch_use:
+            try:
+                cached = ch.get_data_by_id(serv+anime_id)
+                anime_title = cached['title'] if cached else None
+            except (KeyError, TypeError):
+                anime_title = None
+        job_id = batch_download_manager.start_job(
+            serv=serv,
+            anime_id=anime_id,
+            translation_id=translation_id,
+            translation_name=translation_name,
+            quality=quality,
+            episodes=range(first_episode, last_episode+1),
+            anime_title=anime_title,
+            token=token,
+            media_metadata=media_metadata,
+        )
+        return jsonify(batch_download_manager.get_status(job_id)), 202
+    except BatchQueueFullError as ex:
+        return jsonify(error=str(ex)), 429
+    except (TypeError, ValueError) as ex:
+        return jsonify(error=str(ex)), 400
+
+@app.route('/batch_download/status/<string:job_id>/')
+def batch_download_status(job_id):
+    try:
+        return jsonify(batch_download_manager.get_status(job_id))
+    except KeyError:
+        return jsonify(error='Задание не найдено'), 404
 
 @app.route('/download/<string:serv>/<string:id>/<string:data>/<string:download_type>-<string:quality>-<int:seria>/')
 def redirect_to_download(serv, id, data, download_type, quality, seria):
@@ -435,22 +542,17 @@ def fast_download_work(id_type: str, id: str, seria_num: int, translation_id: st
     from fast_download import fast_download, get_path
     translation = translations[translation_id] if translation_id in translations else "Неизвестно"
     add_zeros = len(str(max_series))
-    if config.USE_SAVED_DATA and ch.is_id('sh'+id):
+    if config.USE_SAVED_DATA and ch.is_id(id_type+id):
         if seria_num != 0:
-            fname = str(ch.get_data_by_id('sh'+id)['title'])+'-'+f'Серия-{str(seria_num).zfill(add_zeros)}-Перевод-{translation}-{quality}p'
+            fname = str(ch.get_data_by_id(id_type+id)['title'])+'-'+f'Серия-{str(seria_num).zfill(add_zeros)}-Перевод-{translation}-{quality}p'
         else:
-            fname = str(ch.get_data_by_id('sh'+id)['title'])+'-'+f'Перевод-{translation}-{quality}p'
-        metadata = {
-            'title': ch.get_data_by_id('sh'+id)['title']+' - Серия-'+str(seria_num) if seria_num != 0 else ch.get_data_by_id('sh'+id)['title'],
-            'year': ch.get_data_by_id('sh'+id)['year'],
-            'date': ch.get_data_by_id('sh'+id)['year'],
-            'comment': ch.get_data_by_id('sh'+id)['description'],
-            'artist': translation,
-            'track': seria_num
-        }
+            fname = str(ch.get_data_by_id(id_type+id)['title'])+'-'+f'Перевод-{translation}-{quality}p'
     else:
-        metadata = {}
         fname = f'Перевод-{translation}-{quality}p' if seria_num == 0 else f'Серия-{str(seria_num).zfill(add_zeros)}-Перевод-{translation}-{quality}p'
+    try:
+        metadata = _get_download_media_metadata(id_type, id, seria_num, translation)
+    except Exception:
+        metadata = {}
     if len(fname) > 128: # Ограничение на длину имени файла в винде 255 символов, в линуксе 255 байт (т.е. для кириллицы 128 символов)
         if len(translation) > 100:
             fname = f'{quality}p' if seria_num == 0 else f'Серия-{str(seria_num).zfill(add_zeros)}-{quality}p'
@@ -464,14 +566,13 @@ def fast_download_work(id_type: str, id: str, seria_num: int, translation_id: st
     try:
         hsh, link = fast_download(id, id_type, seria_num, translation_id, quality, config.KODIK_TOKEN,
                             filename=fname, metadata=metadata)
-        if ch_save:
-            # Записываем данные в кеш
+        if ch_save and link is not None:
             try:
                 # Попытка записать данные к уже имеющимся данным
                 ch.add_seria("kp"+id, translation_id, seria_num, link)
             except KeyError:
                 pass
-        return send_file(get_path(hsh), as_attachment=True)
+        return send_file(get_path(hsh), as_attachment=True, download_name=fname+'.mp4')
     except ModuleNotFoundError:
         return abort(500, 'Внимание, на сервере не установлен ffmpeg или программа не может получить к нему доступ. Ffmpeg обязателен для использования быстрой загрузки. (Стандартная загрузка работает без ffmpeg)')
     except FileNotFoundError:
@@ -525,4 +626,3 @@ def favicon():
 
 if __name__ == "__main__":
     socketio.run(app, host=config.HOST, port=config.PORT, debug=config.DEBUG)
-    
